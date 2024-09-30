@@ -40,9 +40,18 @@
 #include "menus/screen_filters.h"
 #include "shell.h"
 
+//#define ROSALINA_MENU_SELF_SCREENSHOT 1 // uncomment this to enable the feature
+
 u32 menuCombo = 0;
 bool isHidInitialized = false;
+bool isQtmInitialized = false;
 u32 mcuFwVersion = 0;
+u8 mcuInfoTable[10] = {0};
+bool mcuInfoTableRead = false;
+
+const char *topScreenType = NULL;
+const char *bottomScreenType = NULL;
+bool areScreenTypesInitialized = false;
 
 // libctru redefinition:
 
@@ -54,8 +63,20 @@ bool hidShouldUseIrrst(void)
 
 static inline u32 convertHidKeys(u32 keys)
 {
-    // Nothing to do yet
+    // No actual conversion done
     return keys;
+}
+
+void scanInputHook(void)
+{
+    hidScanInput();
+
+#ifdef ROSALINA_MENU_SELF_SCREENSHOT
+    // Ugly hack but should work. For self-documentation w/o capture card purposes only.
+    u32 selfScreenshotCombo = KEY_L | KEY_DUP | KEY_SELECT;
+    if ((hidKeysHeld() & selfScreenshotCombo) == selfScreenshotCombo && (hidKeysDown() & selfScreenshotCombo) != 0)
+        menuTakeSelfScreenshot();
+#endif
 }
 
 u32 waitInputWithTimeout(s32 msec)
@@ -75,7 +96,7 @@ u32 waitInputWithTimeout(s32 msec)
         }
         n++;
 
-        hidScanInput();
+        scanInputHook();
         keys = convertHidKeys(hidKeysDown()) | (convertHidKeys(hidKeysDownRepeat()) & DIRECTIONAL_KEYS);
         Draw_Unlock();
     } while (keys == 0 && !menuShouldExit && isHidInitialized && (msec < 0 || n < msec));
@@ -101,7 +122,7 @@ u32 waitInputWithTimeoutEx(u32 *outHeldKeys, s32 msec)
         }
         n++;
 
-        hidScanInput();
+        scanInputHook();
         keys = convertHidKeys(hidKeysDown()) | (convertHidKeys(hidKeysDownRepeat()) & DIRECTIONAL_KEYS);
         *outHeldKeys = convertHidKeys(hidKeysHeld());
         Draw_Unlock();
@@ -126,7 +147,7 @@ static u32 scanHeldKeys(void)
         keys = 0;
     else
     {
-        hidScanInput();
+        scanInputHook();
         keys = convertHidKeys(hidKeysHeld());
     }
 
@@ -226,8 +247,73 @@ static Result menuUpdateMcuInfo(void)
         mcuFwVersion = SYSTEM_VERSION(major - 0x10, minor, 0);
     }
 
+    if (!mcuInfoTableRead)
+        mcuInfoTableRead = R_SUCCEEDED(MCUHWC_ReadRegister(0x7F, mcuInfoTable, sizeof(mcuInfoTable)));
+
     svcCloseHandle(*mcuHwcHandlePtr);
     return res;
+}
+
+static const char *menuGetScreenTypeStr(u8 vendorId)
+{
+    switch (vendorId)
+    {
+        case 1:  return "IPS"; // SHARP
+        case 12: return "TN";  // JDN
+        default: return "unknown";
+    }
+}
+
+static void menuReadScreenTypes(void)
+{
+    if (areScreenTypesInitialized)
+        return;
+
+    if (!isN3DS)
+    {
+        // Old3DS never have IPS screens and GetVendors is not implemented
+        topScreenType = "TN";
+        bottomScreenType = "TN";
+        areScreenTypesInitialized = true;
+    }
+    else
+    {
+        srvSetBlockingPolicy(false);
+
+        Result res = gspLcdInit();
+        if (R_SUCCEEDED(res))
+        {
+            u8 vendors = 0;
+            if (R_SUCCEEDED(GSPLCD_GetVendors(&vendors)))
+            {
+                topScreenType = menuGetScreenTypeStr(vendors >> 4);
+                bottomScreenType = menuGetScreenTypeStr(vendors & 0xF);
+                areScreenTypesInitialized = true;
+            }
+
+            gspLcdExit();
+        }
+
+        srvSetBlockingPolicy(true);
+    }
+}
+
+static void menuInitializeQtm(void)
+{
+    if (isQtmInitialized)
+        return;
+
+    // Steal QTM handle from GSP, because there is a limit of 3 sessions (or 2 before 9.3) for ALL qtm services
+    Handle qtmHandle = 0;
+    for (int i = 0; i < 30 && !qtmIsInitialized(); i++)
+    {
+        if (R_SUCCEEDED(svcControlService(SERVICEOP_STEAL_CLIENT_SESSION, &qtmHandle, "qtm:sp")))
+            *qtmGetSessionHandle() = qtmHandle;
+        else
+            svcSleepThread(100 * 100 * 1000LL);
+    }
+
+    isQtmInitialized = qtmIsInitialized();
 }
 
 static inline u32 menuAdvanceCursor(u32 pos, u32 numItems, s32 displ)
@@ -264,16 +350,23 @@ u32 g_blockMenuOpen = 0;
 
 void menuThreadMain(void)
 {
-    if(isN3DS)
-        N3DSMenu_UpdateStatus();
-
-    while (!isServiceUsable("ac:u") || !isServiceUsable("hid:USER") || !isServiceUsable("gsp::Gpu") || !isServiceUsable("cdc:CHK"))
+    while (!isServiceUsable("ac:u") || !isServiceUsable("hid:USER") || !isServiceUsable("gsp::Gpu") || !isServiceUsable("gsp::Lcd") || !isServiceUsable("cdc:CHK"))
         svcSleepThread(250 * 1000 * 1000LL);
+
+    if (isN3DS)
+    {
+        while (!isServiceUsable("qtm:u"))
+            svcSleepThread(250 * 1000 * 1000LL);
+        menuInitializeQtm();
+        N3DSMenu_UpdateStatus();
+    }
 
     handleShellOpened();
 
     hidInit(); // assume this doesn't fail
     isHidInitialized = true;
+
+    menuReadScreenTypes();
 
     while(!preTerminationRequested)
     {
@@ -283,7 +376,9 @@ void menuThreadMain(void)
 
         Cheat_ApplyCheats();
 
-        if(((scanHeldKeys() & menuCombo) == menuCombo) && !g_blockMenuOpen)
+        u32 kHeld = scanHeldKeys();
+
+        if(((kHeld & menuCombo) == menuCombo) && !g_blockMenuOpen)
         {
             menuEnter();
             if(isN3DS) N3DSMenu_UpdateStatus();
@@ -380,6 +475,7 @@ static void menuDraw(Menu *menu, u32 selected)
         int n = sprintf(ipBuffer, "%hhu.%hhu.%hhu.%hhu", addr[0], addr[1], addr[2], addr[3]);
         Draw_DrawString(SCREEN_BOT_WIDTH - 10 - SPACING_X * n, 10, COLOR_WHITE, ipBuffer);
     }
+
     else
         Draw_DrawFormattedString(SCREEN_BOT_WIDTH - 10 - SPACING_X * 15, 10, COLOR_WHITE, "%15s", "");
 
@@ -489,17 +585,12 @@ void menuShow(Menu *root)
             else
                 break;
         }
-        else if(pressed & KEY_DOWN)
+        else if(pressed & (KEY_DOWN | KEY_UP))
         {
-            selectedItem = menuAdvanceCursor(selectedItem, numItems, 1);
-            if (menuItemIsHidden(&currentMenu->items[selectedItem]))
-                selectedItem = menuAdvanceCursor(selectedItem, numItems, 1);
-        }
-        else if(pressed & KEY_UP)
-        {
-            selectedItem = menuAdvanceCursor(selectedItem, numItems, -1);
-            if (menuItemIsHidden(&currentMenu->items[selectedItem]))
-                selectedItem = menuAdvanceCursor(selectedItem, numItems, -1);
+            s32 n = (pressed & KEY_DOWN) != 0 ? 1 : -1;
+            do {
+                selectedItem = menuAdvanceCursor(selectedItem, numItems, n);
+            } while (menuItemIsHidden(&currentMenu->items[selectedItem])); // assume at least one item is visible
         }
 
         Draw_Lock();

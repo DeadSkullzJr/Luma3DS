@@ -62,12 +62,18 @@ typedef struct MenuItem {
 typedef struct Menu {
     const char *title;
 
-    MenuItem items[16];
+    MenuItem items[24];
 } Menu;
 
 extern u32 menuCombo;
 extern bool isHidInitialized;
+extern bool isQtmInitialized;
 extern u32 mcuFwVersion;
+extern u8 mcuInfoTable[10];
+extern bool mcuInfoTableRead;
+extern const char *topScreenType;
+extern const char *bottomScreenType;
+extern bool areScreenTypesInitialized;
 
 // From main.c
 extern bool isN3DS;
